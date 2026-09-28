@@ -27,27 +27,29 @@ actor Cache<Key: Hashable, Value: Sendable> {
 }
 ```
 
-It coalesces requests, which is the point - and then it fails in four ways that only show up in production:
+It coalesces requests, which is the point. Then it fails in four ways that only show up in production:
 
-1. **One cancelled caller cancels everyone.** `try await task.value` propagates cancellation *into* the shared task. A cell scrolls off screen, the request dies, and the four other cells waiting on it get a `CancellationError` instead of an avatar.
-2. **A failed load is cached forever.** The task stays in the dictionary holding its error, so every later caller replays the same failure. A single dropped packet poisons the key for the lifetime of the app.
-3. **It grows without limit.** No capacity, no expiry - a cache that never forgets is a memory leak with good intentions.
-4. **You can't test the expiry you eventually bolt on**, because it reads the wall clock.
+1. **Cancellation does nothing.** `await task.value` is not a cancellation point. Cancel a caller and it keeps waiting for the whole load and then returns the value as if nothing happened - measured at 317 ms on a 300 ms load, with `Task.isCancelled` true the entire time. The cell that scrolled off screen ten frames ago is still holding a continuation, and still decoding an image nobody will see.
+2. **The load can't be stopped either.** Cancel *every* caller and the shared `Task` runs to completion regardless: nothing counts waiters, so nothing knows the work has become pointless.
+3. **A failed load is cached forever.** The task stays in the dictionary holding its error, so every later caller replays the same failure. One dropped packet poisons that key for the life of the process.
+4. **It grows without limit, and the expiry you bolt on later can't be tested**, because it reads the wall clock.
 
-This package is that actor with those four things fixed, plus tests that prove each one.
+This package is that actor with those four things fixed, and a test for each.
 
 ## Cancellation, precisely
 
 Each caller waits on its own continuation instead of on the shared `Task`, so cancellation is per caller:
 
-| What happens | What the cache does |
-|---|---|
-| One of several callers is cancelled | That caller throws `CancellationError` **immediately**. The load keeps running for the rest. |
-| The **last** caller is cancelled | The load itself is cancelled, and the key is removed. Nothing is left running for nobody. |
-| A caller is cancelled before it ever suspends | Still throws `CancellationError` - no waiting on a value that will never arrive. |
-| The load throws | The entry is dropped, every waiter gets the error, and the next caller starts a fresh attempt. |
+| What happens | `AsyncCache` | `[Key: Task]` |
+|---|---|---|
+| One of several callers is cancelled | That caller throws `CancellationError` **at once**. The load keeps running for the rest. | Waits for the full load, then returns the value. |
+| The **last** caller is cancelled | The load is cancelled and the key removed. Nothing keeps running for nobody. | The load runs to completion for nobody. |
+| A caller is cancelled before it ever suspends | Throws `CancellationError` - never waits on a value it will not use. | Waits for the full load. |
+| The load throws | The entry is dropped, every waiter gets the error, and the next caller retries. | The error is cached and replayed for ever. |
 
-That middle row is the reason this exists: it needs the cache to know how many callers a load still has, which a `[Key: Task]` dictionary cannot know.
+The second row is the reason this exists. It needs the cache to know how many callers a load still has, which a dictionary of tasks cannot know.
+
+That right-hand column is not a straw man from memory: it is [a test suite](Tests/AsyncCacheTests/NaiveCacheTests.swift) that runs the dictionary version and asserts what it does.
 
 ## Usage
 
@@ -104,7 +106,8 @@ print(stats.coalesced)   // requests that joined a load in flight
 
 ## Design notes
 
-- **`actor`, not a lock.** All mutable state lives on the actor. Every `await` inside it is treated as a suspension point where the world may have changed - the reentrancy bug in the naive version above is exactly a missing re-check after an `await`.
+- **`actor`, not a lock.** All mutable state lives on the actor, and every `await` inside it is a point where the world may have changed underneath - which is the other trap in the naive version: `await` anything between the lookup and the insert and two callers each start their own load.
+- **Waiters, not `Task.value`.** Each caller gets its own `CheckedContinuation`, registered under an id, wrapped in `withTaskCancellationHandler`. That is what makes cancellation per caller, and what lets the cache count who is left.
 - **LRU order in O(1) without classes.** `LRUOrder` is a dictionary of `(newer, older)` links rather than a doubly linked list of nodes: same complexity, no reference counting, still a value type.
 - **Failures are never cached.** If you want negative caching, cache a `Result` as your `Value`.
 - **Swift 6 language mode**, strict concurrency, no `@unchecked Sendable` anywhere in the library.
