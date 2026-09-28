@@ -1,5 +1,7 @@
 # swift-async-cache
 
+[![CI](https://github.com/nevzorov46/swift-async-cache/actions/workflows/ci.yml/badge.svg)](https://github.com/nevzorov46/swift-async-cache/actions/workflows/ci.yml)
+
 An async cache that loads each key **at most once**, no matter how many callers ask at the same time - and gets cancellation right.
 
 ```swift
