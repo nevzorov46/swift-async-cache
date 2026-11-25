@@ -188,6 +188,75 @@ struct LifetimeTests {
 
 /// Spins until a condition holds. Every wait in these tests is on a state change,
 /// never on a timer, so the suite is deterministic.
+@Suite("Invalidation in flight")
+struct InvalidationInFlightTests {
+    // A balance is being read when a transfer goes through and the app invalidates
+    // it. The read that started before the transfer must not come back as fresh.
+
+    @Test("a load in flight when invalidated reaches its callers but is not stored")
+    func invalidatedLoadIsNotStored() async throws {
+        let loader = GatedLoader()
+        let cache = AsyncCache(loader: loader)
+
+        let before = Task { try await cache.value(for: "hello") }
+        await loader.waitForCalls(1)
+        await cache.invalidate("hello")
+        await loader.release()
+
+        #expect(try await before.value == 5)
+        #expect(await cache.count == 0)
+    }
+
+    @Test("a caller arriving after invalidate starts a fresh load")
+    func callerAfterInvalidateLoadsAgain() async throws {
+        let loader = GatedLoader()
+        let cache = AsyncCache(loader: loader)
+
+        let before = Task { try await cache.value(for: "hello") }
+        await loader.waitForCalls(1)
+        await cache.invalidate("hello")
+        let after = Task { try await cache.value(for: "hello") }
+        await waitUntil { await cache.statistics.misses + cache.statistics.coalesced == 2 }
+
+        #expect(await cache.statistics.misses == 2)
+        #expect(await cache.statistics.coalesced == 0)
+        if await cache.statistics.misses == 2 { await loader.waitForCalls(2) }
+        await loader.release()
+        _ = try await before.value
+        _ = try await after.value
+        #expect(await cache.count == 1)
+    }
+
+    @Test("removeAll cuts loose every load in flight")
+    func removeAllDetachesLoads() async throws {
+        let loader = GatedLoader()
+        let cache = AsyncCache(loader: loader)
+
+        let before = Task { try await cache.value(for: "hello") }
+        await loader.waitForCalls(1)
+        await cache.removeAll()
+        await loader.release()
+
+        #expect(try await before.value == 5)
+        #expect(await cache.count == 0)
+    }
+
+    @Test("cancelling the last caller of a detached load cancels the load")
+    func cancellingDetachedLoad() async throws {
+        let loader = GatedLoader()
+        let cache = AsyncCache(loader: loader)
+
+        let before = Task { try await cache.value(for: "hello") }
+        await loader.waitForCalls(1)
+        await cache.invalidate("hello")
+        before.cancel()
+
+        await #expect(throws: CancellationError.self) { try await before.value }
+        await waitUntil { await loader.cancellations == 1 }
+        #expect(await cache.statistics.cancellations == 1)
+    }
+}
+
 func waitUntil(_ condition: () async -> Bool) async {
     while await condition() == false { await Task.yield() }
 }

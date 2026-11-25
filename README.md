@@ -81,6 +81,8 @@ await avatars.removeAll()         // drop all of them
 
 `prefetch` is the one to reach for in a `UICollectionViewDataSourcePrefetching` or `.task` on a row that's about to appear: it warms the key without a caller, and a real `value(for:)` arriving mid-flight joins that load instead of starting a second one.
 
+`invalidate` during a load cuts that load loose: callers already waiting still get its result, but it is not stored, and the next caller starts a fresh load. Without this, a balance read before a transfer would come back after the transfer as if it were new.
+
 ### Deterministic tests
 
 The clock is injected, so nothing in the test suite sleeps:

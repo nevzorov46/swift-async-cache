@@ -26,6 +26,8 @@ public actor AsyncCache<L: Loader, C: Clock> where C.Duration == Duration {
     }
 
     private struct Loading {
+        /// Tells this load apart from a later load of the same key.
+        let generation: Int
         let task: Task<L.Value, Error>
         var waiters: [Int: CheckedContinuation<L.Value, Error>] = [:]
     }
@@ -45,6 +47,10 @@ public actor AsyncCache<L: Loader, C: Clock> where C.Duration == Duration {
     private var entries: [L.Key: Entry] = [:]
     private var order = LRUOrder<L.Key>()
     private var nextWaiterID = 0
+    private var nextGeneration = 0
+    /// Loads cut loose by `invalidate` or `removeAll` while in flight. Their callers
+    /// still get the result; the cache never stores it.
+    private var detached: [Int: Loading] = [:]
 
     public private(set) var statistics = CacheStatistics()
 
@@ -94,15 +100,28 @@ public actor AsyncCache<L: Loader, C: Clock> where C.Duration == Duration {
         }
     }
 
-    /// Drops the value for `key`. A load already in flight is left alone: its
-    /// callers still get their value, it just won't be cached.
+    /// Drops the value for `key`.
+    ///
+    /// A load already in flight is cut loose: callers already waiting for it still
+    /// get its result, but the result is not stored, and the next caller starts a
+    /// fresh load. Data that was being read before the change is never served as
+    /// if it were read after it.
     public func invalidate(_ key: L.Key) {
-        guard case .ready = entries[key] else { return }
-        forget(key)
+        switch entries[key] {
+        case .ready:
+            forget(key)
+        case .loading(let loading):
+            detach(loading)
+            entries[key] = nil
+        case nil:
+            break
+        }
     }
 
+    /// Drops every value. Loads in flight are cut loose, as with `invalidate`.
     public func removeAll() {
-        entries = entries.filter { if case .loading = $0.value { return true } else { return false } }
+        for case .loading(let loading) in entries.values { detach(loading) }
+        entries = [:]
         order.removeAll()
     }
 
@@ -114,13 +133,26 @@ public actor AsyncCache<L: Loader, C: Clock> where C.Duration == Duration {
 
     private func startLoad(of key: L.Key) {
         let loader = self.loader
+        nextGeneration += 1
+        let generation = nextGeneration
         let task = Task { try await loader.load(key) }
-        entries[key] = .loading(Loading(task: task))
+        entries[key] = .loading(Loading(generation: generation, task: task))
         // A separate task carries the result back onto the actor, so that waiters
         // are resumed in one place whether they arrived before or after the load.
         Task { [weak self] in
             let result = await task.result
-            await self?.finishLoad(of: key, with: result)
+            await self?.finishLoad(of: key, generation: generation, with: result)
+        }
+    }
+
+    /// Keeps a load's callers waiting for it while the key starts over. A load
+    /// nobody is waiting for (a prefetch) is simply cancelled.
+    private func detach(_ loading: Loading) {
+        if loading.waiters.isEmpty {
+            loading.task.cancel()
+            statistics.cancellations += 1
+        } else {
+            detached[loading.generation] = loading
         }
     }
 
@@ -158,8 +190,15 @@ public actor AsyncCache<L: Loader, C: Clock> where C.Duration == Duration {
         entries[key] = .loading(loading)
     }
 
-    private func finishLoad(of key: L.Key, with result: Result<L.Value, Error>) {
-        guard case .loading(let loading) = entries[key] else { return }
+    private func finishLoad(of key: L.Key, generation: Int, with result: Result<L.Value, Error>) {
+        if let loading = detached.removeValue(forKey: generation) {
+            // Invalidated while in flight: answer the callers, store nothing.
+            if case .failure = result { statistics.failures += 1 }
+            for continuation in loading.waiters.values { continuation.resume(with: result) }
+            return
+        }
+        // A later load of the same key may have taken this slot: it is not ours to finish.
+        guard case .loading(let loading) = entries[key], loading.generation == generation else { return }
         switch result {
         case .success(let value):
             store(value, for: key)
@@ -174,12 +213,26 @@ public actor AsyncCache<L: Loader, C: Clock> where C.Duration == Duration {
     }
 
     private func cancelWaiter(_ id: Int, key: L.Key) {
-        guard case .loading(var loading) = entries[key],
+        if case .loading(var loading) = entries[key],
+           let continuation = loading.waiters.removeValue(forKey: id) {
+            continuation.resume(throwing: CancellationError())
+            entries[key] = .loading(loading)
+            dropLoadIfUnwanted(key)
+            return
+        }
+        // The caller may be waiting on a load that was cut loose by `invalidate`.
+        guard let generation = detached.first(where: { $0.value.waiters[id] != nil })?.key,
+              var loading = detached[generation],
               let continuation = loading.waiters.removeValue(forKey: id)
         else { return }
         continuation.resume(throwing: CancellationError())
-        entries[key] = .loading(loading)
-        dropLoadIfUnwanted(key)
+        if loading.waiters.isEmpty {
+            loading.task.cancel()
+            detached[generation] = nil
+            statistics.cancellations += 1
+        } else {
+            detached[generation] = loading
+        }
     }
 
     /// Nobody is waiting for this load any more, so stop paying for it.
